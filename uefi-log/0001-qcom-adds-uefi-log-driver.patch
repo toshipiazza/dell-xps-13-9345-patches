@@ -1,0 +1,133 @@
+From 967ede395b33d19374ad6fed309420f340dbf08d Mon Sep 17 00:00:00 2001
+From: Toshi Piazza <toshi.piazza@gmail.com>
+Date: Sat, 15 Nov 2025 13:02:50 -0800
+Subject: [PATCH] qcom: adds uefi-log driver
+
+---
+ arch/arm64/boot/dts/qcom/x1e80100.dtsi |  5 ++
+ drivers/soc/qcom/Kconfig               |  5 ++
+ drivers/soc/qcom/Makefile              |  1 +
+ drivers/soc/qcom/uefi-log.c            | 67 ++++++++++++++++++++++++++
+ 4 files changed, 78 insertions(+)
+ create mode 100644 drivers/soc/qcom/uefi-log.c
+
+diff --git a/arch/arm64/boot/dts/qcom/x1e80100.dtsi b/arch/arm64/boot/dts/qcom/x1e80100.dtsi
+index b5bf426cd6df..c657c00f5daa 100644
+--- a/arch/arm64/boot/dts/qcom/x1e80100.dtsi
++++ b/arch/arm64/boot/dts/qcom/x1e80100.dtsi
+@@ -733,6 +733,11 @@ opp-120000000 {
+ 		};
+ 	};
+ 
++	uefi-log {
++		compatible = "qcom,uefi-log";
++		memory-region = <&uefi_log_mem>;
++	};
++
+ 	smp2p-adsp {
+ 		compatible = "qcom,smp2p";
+ 
+diff --git a/drivers/soc/qcom/Kconfig b/drivers/soc/qcom/Kconfig
+index 2caadbbcf830..1216faa4ae87 100644
+--- a/drivers/soc/qcom/Kconfig
++++ b/drivers/soc/qcom/Kconfig
+@@ -26,6 +26,11 @@ config QCOM_COMMAND_DB
+ 	  resource on a RPM-hardened platform must use this database to get
+ 	  SoC specific identifier and information for the shared resources.
+ 
++config QCOM_UEFI_LOG
++	tristate "Qualcomm UEFI Log"
++	depends on ARCH_QCOM || COMPILE_TEST
++	depends on OF_RESERVED_MEM
++
+ config QCOM_GENI_SE
+ 	tristate "QCOM GENI Serial Engine Driver"
+ 	depends on ARCH_QCOM || COMPILE_TEST
+diff --git a/drivers/soc/qcom/Makefile b/drivers/soc/qcom/Makefile
+index b7f1d2a57367..288a97367ad9 100644
+--- a/drivers/soc/qcom/Makefile
++++ b/drivers/soc/qcom/Makefile
+@@ -4,6 +4,7 @@ CFLAGS_qcom_aoss.o := -I$(src)
+ obj-$(CONFIG_QCOM_AOSS_QMP) +=	qcom_aoss.o
+ obj-$(CONFIG_QCOM_GENI_SE) +=	qcom-geni-se.o
+ obj-$(CONFIG_QCOM_COMMAND_DB) += cmd-db.o
++obj-$(CONFIG_QCOM_UEFI_LOG) += uefi-log.o
+ obj-$(CONFIG_QCOM_GSBI)	+=	qcom_gsbi.o
+ obj-$(CONFIG_QCOM_MDT_LOADER)	+= mdt_loader.o
+ obj-$(CONFIG_QCOM_OCMEM)	+= ocmem.o
+diff --git a/drivers/soc/qcom/uefi-log.c b/drivers/soc/qcom/uefi-log.c
+new file mode 100644
+index 000000000000..4aec2789033f
+--- /dev/null
++++ b/drivers/soc/qcom/uefi-log.c
+@@ -0,0 +1,67 @@
++#include <linux/debugfs.h>
++#include <linux/of.h>
++#include <linux/module.h>
++#include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++
++struct debugfs_blob_wrapper uefi_log_blob;
++
++static int qcom_uefi_log_probe(struct platform_device *pdev)
++{
++	struct reserved_mem *rmem;
++	struct device_node *node;
++	void *data;
++
++	node = of_parse_phandle(pdev->dev.of_node, "memory-region", 0);
++	if (!node) {
++		dev_err(&pdev->dev, "no memory-region specified\n");
++		return -EINVAL;
++	}
++
++	rmem = of_reserved_mem_lookup(node);
++	of_node_put(node);
++	if (!rmem) {
++		dev_err(&pdev->dev, "unable to resolve memory-region\n");
++		return -EINVAL;
++	}
++
++	data = devm_ioremap_wc(&pdev->dev, rmem->base, rmem->size);
++	if (!data) {
++		dev_err(&pdev->dev, "unable to map memory region: %pa+%llx\n",
++			&rmem->base, rmem->size);
++		return -ENOMEM;
++	}
++
++	uefi_log_blob.data = data;
++	uefi_log_blob.size = rmem->size;
++	debugfs_create_blob("uefi-log", 0400, NULL, &uefi_log_blob);
++
++	device_set_pm_not_required(&pdev->dev);
++
++	return 0;
++}
++
++static const struct of_device_id qcom_uefi_log_of_match[] = {
++	{ .compatible = "qcom,uefi-log" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, qcom_uefi_log_of_match);
++
++static struct platform_driver qcom_uefi_log_driver = {
++	.probe  = qcom_uefi_log_probe,
++	.driver = {
++		   .name  = "qcom_uefi_log",
++		   .of_match_table = qcom_uefi_log_of_match,
++		   .suppress_bind_attrs = true,
++	},
++};
++
++static int __init uefi_log_device_init(void)
++{
++	return platform_driver_register(&qcom_uefi_log_driver);
++}
++module_init(uefi_log_device_init);
++
++MODULE_DESCRIPTION("Qualcomm Technologies, Inc. UEFI Log");
++MODULE_LICENSE("GPL v2");
+-- 
+2.51.0
+

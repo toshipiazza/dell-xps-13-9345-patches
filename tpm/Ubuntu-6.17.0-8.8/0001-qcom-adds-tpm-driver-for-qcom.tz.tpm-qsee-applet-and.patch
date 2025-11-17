@@ -1,0 +1,499 @@
+From 43a117f134ba864febb5dd572c0f075035edf2f9 Mon Sep 17 00:00:00 2001
+From: Toshi Piazza <toshi.piazza@gmail.com>
+Date: Sat, 15 Nov 2025 22:55:18 -0800
+Subject: [PATCH] qcom: adds tpm driver for qcom.tz.tpm qsee applet and x1e
+ devices
+
+---
+ arch/arm64/boot/dts/qcom/x1e80100.dtsi   |   2 +
+ drivers/char/tpm/Kconfig                 |   5 +
+ drivers/char/tpm/Makefile                |   1 +
+ drivers/char/tpm/tpm_qcom.c              | 339 +++++++++++++++++++++++
+ drivers/firmware/qcom/qcom_qseecom.c     |   1 +
+ drivers/firmware/qcom/qcom_tzmem.c       |  41 ++-
+ include/linux/firmware/qcom/qcom_tzmem.h |   3 +
+ 7 files changed, 379 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/char/tpm/tpm_qcom.c
+
+diff --git a/arch/arm64/boot/dts/qcom/x1e80100.dtsi b/arch/arm64/boot/dts/qcom/x1e80100.dtsi
+index b5bf426cd6df..6f7423326a0b 100644
+--- a/arch/arm64/boot/dts/qcom/x1e80100.dtsi
++++ b/arch/arm64/boot/dts/qcom/x1e80100.dtsi
+@@ -322,6 +322,8 @@ scm: scm {
+ 			interconnects = <&aggre2_noc MASTER_CRYPTO QCOM_ICC_TAG_ALWAYS
+ 					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+ 			qcom,dload-mode = <&tcsr 0x19000>;
++
++			tpm-control-mem = <&tpm_control_mem>;
+ 		};
+ 
+ 		scmi {
+diff --git a/drivers/char/tpm/Kconfig b/drivers/char/tpm/Kconfig
+index dddd702b2454..176659bc8674 100644
+--- a/drivers/char/tpm/Kconfig
++++ b/drivers/char/tpm/Kconfig
+@@ -234,6 +234,11 @@ config TCG_FTPM_TEE
+ 	help
+ 	  This driver proxies for firmware TPM running in TEE.
+ 
++config QCOM_TPM
++	tristate "QSEE based TPM Interface"
++        depends on ARCH_QCOM || COMPILE_TEST
++        depends on OF_RESERVED_MEM
++
+ config TCG_SVSM
+ 	tristate "SNP SVSM vTPM interface"
+ 	depends on AMD_MEM_ENCRYPT
+diff --git a/drivers/char/tpm/Makefile b/drivers/char/tpm/Makefile
+index 9de1b3ea34a9..f2702c03e288 100644
+--- a/drivers/char/tpm/Makefile
++++ b/drivers/char/tpm/Makefile
+@@ -46,3 +46,4 @@ obj-$(CONFIG_TCG_ARM_CRB_FFA) += tpm_crb_ffa.o
+ obj-$(CONFIG_TCG_VTPM_PROXY) += tpm_vtpm_proxy.o
+ obj-$(CONFIG_TCG_FTPM_TEE) += tpm_ftpm_tee.o
+ obj-$(CONFIG_TCG_SVSM) += tpm_svsm.o
++obj-$(CONFIG_QCOM_TPM) += tpm_qcom.o
+diff --git a/drivers/char/tpm/tpm_qcom.c b/drivers/char/tpm/tpm_qcom.c
+new file mode 100644
+index 000000000000..21863bf1c881
+--- /dev/null
++++ b/drivers/char/tpm/tpm_qcom.c
+@@ -0,0 +1,339 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++
++#include <linux/firmware/qcom/qcom_qseecom.h>
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/firmware/qcom/qcom_tzmem.h>
++
++#include "tpm.h"
++
++#define QSEE_CMD_TPM_SEND_COMMAND 0x4008
++#define QSEE_CMD_TPM_GET_VERSION  0x1000
++
++struct qsee_req_tpm_get_version {
++	u32 command_id;
++} __packed;
++
++struct qsee_rsp_tpm_get_version {
++	u32 status;
++	u64 version;
++} __packed;
++
++struct qsee_req_tpm_send_command {
++	u32 command_id;
++} __packed;
++
++struct qsee_rsp_tpm_send_command {
++	u64 unused;
++} __packed;
++
++struct qctpm_client {
++	u32 app_id;
++	struct qcom_tzmem_pool *mempool;
++	struct tpm_chip *chip;
++	phys_addr_t mem_phys;
++	void *mem_virt;
++	u64 mem_hnd;
++};
++
++struct qsee_control_area {
++	u32 padding1;
++	u32 failure;
++	u32 padding2;
++	u32 start;
++	u64 padding3;
++	u32 reqlen;
++	u64 reqptr;
++	u32 rsplen;
++	u64 rspptr;
++	u8 reqbuf[0x1000];
++	u8 rspbuf[0x1000];
++} __packed;
++
++static int qcom_tpm_op_send(struct tpm_chip *chip, u8 *buf, size_t bufsiz,
++			    size_t cmd_len)
++{
++	struct qctpm_client *qctpm = dev_get_drvdata(chip->dev.parent);
++	struct qsee_control_area *control_area = qctpm->mem_virt;
++	struct qsee_req_tpm_send_command *req_data;
++	struct qsee_rsp_tpm_send_command *rsp_data;
++	void *cmd_buf __free(qcom_tzmem) = NULL;
++	ssize_t status;
++	struct tpm_header *rsphdr;
++	size_t rsplen;
++	size_t req_offs;
++	size_t rsp_offs;
++
++	if (cmd_len > sizeof(control_area->reqbuf)) {
++		dev_err(&chip->dev,
++			"%s: len=%zd exceeds max command size\n", __func__,
++			cmd_len);
++		return -EIO;
++	}
++
++	req_offs = offsetof(struct qsee_control_area, reqbuf);
++	rsp_offs = offsetof(struct qsee_control_area, rspbuf);
++
++	control_area->failure = 0;
++	control_area->start = 1;
++	control_area->reqptr = qctpm->mem_phys + req_offs;
++	control_area->rspptr = qctpm->mem_phys + rsp_offs;
++	control_area->reqlen = cmd_len;
++	control_area->rsplen = sizeof(control_area->rspbuf);
++	memcpy(control_area->reqbuf, buf, cmd_len);
++	memset(control_area->rspbuf, 0, sizeof(control_area->rspbuf));
++
++	cmd_buf = qcom_tzmem_alloc(qctpm->mempool,
++				   sizeof(*req_data) + sizeof(*rsp_data),
++				   GFP_KERNEL);
++	if (!cmd_buf)
++		return -EIO;
++
++	req_data = cmd_buf;
++	rsp_data = cmd_buf + sizeof(*req_data);
++
++	req_data->command_id = QSEE_CMD_TPM_SEND_COMMAND;
++
++	status = qcom_scm_qseecom_app_send(qctpm->app_id, cmd_buf,
++					   sizeof(*req_data),
++					   cmd_buf + sizeof(*req_data),
++					   sizeof(*rsp_data));
++	if (status)
++		return status;
++
++	/* verify response was processed */
++	if (control_area->start) {
++		dev_err(&chip->dev,
++			"%s: TPM did not process request\n", __func__);
++		return -EIO;
++	}
++
++	if (control_area->failure) {
++		dev_err(&chip->dev, "%s: TPM reported failure\n", __func__);
++		return -EIO;
++	}
++
++	rsphdr = (struct tpm_header *)control_area->rspbuf;
++	rsplen = be32_to_cpu(rsphdr->length);
++
++	/* sanity check rsplen */
++	if (rsplen < TPM_HEADER_SIZE) {
++		dev_err(&chip->dev,
++			"%s: tpm response header too small\n", __func__);
++		return -EIO;
++	}
++
++	if (rsplen > sizeof(control_area->rspbuf)) {
++		dev_err(&chip->dev,
++			"%s: rsplen=%zd exceeds MAX_RESPONSE_SIZE\n", __func__,
++			rsplen);
++		return -EIO;
++	}
++
++	/* return TPM response to buf */
++	if (rsplen > bufsiz) {
++		dev_err(&chip->dev,
++			"%s: resp_len=%zd exceeds bufsiz=%zd\n", __func__,
++			rsplen, bufsiz);
++		return -EIO;
++	}
++
++	memcpy(buf, control_area->rspbuf, rsplen);
++
++	return rsplen;
++}
++
++static const struct tpm_class_ops qcom_tpm_ops = {
++	.flags = TPM_OPS_AUTO_STARTUP,
++	.send = qcom_tpm_op_send,
++};
++
++static int qcom_tpm_get_version(u32 app_id, struct qcom_tzmem_pool *mempool,
++				u64 *version)
++{
++	struct qsee_req_tpm_get_version *req_data;
++	struct qsee_rsp_tpm_get_version *rsp_data;
++	void *cmd_buf __free(qcom_tzmem) = NULL;
++	ssize_t status;
++
++	cmd_buf = qcom_tzmem_alloc(mempool,
++				   sizeof(*req_data) + sizeof(*rsp_data),
++				   GFP_KERNEL);
++	if (!cmd_buf)
++		return -EIO;
++
++	req_data = cmd_buf;
++	rsp_data = cmd_buf + sizeof(*req_data);
++
++	req_data->command_id = QSEE_CMD_TPM_GET_VERSION;
++
++	status = qcom_scm_qseecom_app_send(app_id, cmd_buf,
++					   sizeof(*req_data),
++					   cmd_buf + sizeof(*req_data),
++					   sizeof(*rsp_data));
++	if (status)
++		return status;
++
++	if (rsp_data->status == 0xffffffff)
++		return -EIO;
++
++	*version = rsp_data->version;
++
++	return 0;
++}
++
++static int qcom_tpm_probe(struct auxiliary_device *aux_dev,
++			  const struct auxiliary_device_id *aux_dev_id)
++{
++	u32 app_id;
++	u64 tpm_version;
++	int ret;
++	struct reserved_mem *rmem;
++	struct device_node *node;
++	struct qcom_tzmem_pool_config pool_config;
++	void *control_area;
++	u64 control_area_hnd = 0;
++	struct qctpm_client *qctpm;
++	struct qcom_tzmem_pool *mempool;
++	struct tpm_chip *chip;
++
++	/* Try to find the app ID, skip device if not found */
++	ret = qcom_scm_qseecom_app_get_id("qcom.tz.tpm", &app_id);
++	if (ret)
++		return ret == -ENOENT ? 0 : ret;
++
++	/* initialize pool memory for trustzone */
++	memset(&pool_config, 0, sizeof(pool_config));
++	pool_config.initial_size = SZ_4K;
++	pool_config.policy = QCOM_TZMEM_POLICY_MULTIPLIER;
++	pool_config.increment = 2;
++	pool_config.max_size = SZ_256K;
++
++	mempool = devm_qcom_tzmem_pool_new(&aux_dev->dev, &pool_config);
++	if (IS_ERR(mempool))
++		return PTR_ERR(mempool);
++
++	/* quick sanity check by querying TPM version */
++	ret = qcom_tpm_get_version(app_id, mempool, &tpm_version);
++	if (ret < 0) {
++		dev_err(&aux_dev->dev, "unable to query TPM version\n");
++		return -EINVAL;
++	}
++
++	dev_info(&aux_dev->dev, "got TPM version 0x%llx\n", tpm_version);
++
++	/* map reserved tpm control area memory */
++	node = of_parse_phandle(aux_dev->dev.parent->parent->of_node,
++				"tpm-control-mem", 0);
++	if (!node) {
++		dev_err(&aux_dev->dev, "no tpm-control-mem specified\n");
++		return -EINVAL;
++	}
++
++	rmem = of_reserved_mem_lookup(node);
++	of_node_put(node);
++	if (!rmem) {
++		dev_err(&aux_dev->dev, "unable to resolve memory-region\n");
++		return -EINVAL;
++	}
++
++	control_area = devm_ioremap_wc(&aux_dev->dev, rmem->base, rmem->size);
++	if (!control_area) {
++		dev_err(&aux_dev->dev,
++			"unable to map memory region: %pa+%llx\n",
++			&rmem->base, rmem->size);
++		return -ENOMEM;
++	}
++
++	/* register tpm control area with QSEE shm bridge */
++	ret = qcom_tzmem_init_addr(rmem->base, rmem->size, &control_area_hnd);
++	if (ret) {
++		dev_err(&aux_dev->dev,
++			"%s: unable to init tzmem area %d\n", __func__,
++			ret);
++		return ret;
++	}
++
++	/* Allocate new struct tpm_chip instance */
++	chip = tpm_chip_alloc(&aux_dev->dev, &qcom_tpm_ops);
++	if (IS_ERR(chip)) {
++		dev_err(&aux_dev->dev,
++			"%s: tpm_chip_alloc failed\n", __func__);
++		ret = PTR_ERR(chip);
++		goto deregister_hnd;
++	}
++
++	chip->flags |= TPM_CHIP_FLAG_TPM2 | TPM_CHIP_FLAG_SYNC;
++
++	/* create and initialize qctpm */
++	qctpm = devm_kzalloc(&aux_dev->dev, sizeof(*qctpm), GFP_KERNEL);
++	if (!qctpm) {
++		ret = -ENOMEM;
++		goto out_chip;
++	}
++
++	qctpm->app_id = app_id;
++	qctpm->mempool = mempool;
++	qctpm->mem_phys = rmem->base;
++	qctpm->mem_virt = control_area;
++	qctpm->chip = chip;
++	qctpm->mem_hnd = control_area_hnd;
++
++	auxiliary_set_drvdata(aux_dev, qctpm);
++
++	/* Create a character device for the fTPM */
++	ret = tpm_chip_register(chip);
++	if (ret) {
++		dev_err(&aux_dev->dev,
++			"%s: tpm_chip_register failed with rc=%d\n", __func__,
++			ret);
++		goto out_chip;
++	}
++
++	return 0;
++
++out_chip:
++	put_device(&chip->dev);
++
++deregister_hnd:
++	qcom_tzmem_cleanup_addr(control_area_hnd);
++
++	return ret;
++}
++
++static void qcom_tpm_remove(struct auxiliary_device *aux_dev)
++{
++	struct qctpm_client *qctpm = auxiliary_get_drvdata(aux_dev);
++
++	/* Release the chip */
++	tpm_chip_unregister(qctpm->chip);
++
++	/* frees chip */
++	put_device(&qctpm->chip->dev);
++
++	/* remove control area mapping */
++	qcom_tzmem_cleanup_addr(qctpm->mem_hnd);
++}
++
++static const struct auxiliary_device_id qcom_tpm_id_table[] = {
++	{ .name = "qcom_qseecom.tpm" },
++	{}
++};
++MODULE_DEVICE_TABLE(auxiliary, qcom_tpm_id_table);
++
++static struct auxiliary_driver qcom_tpm_driver = {
++	.probe = qcom_tpm_probe,
++	.remove = qcom_tpm_remove,
++	.id_table = qcom_tpm_id_table,
++	.driver = {
++		.name = "qcom_qseecom_tpm",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++};
++module_auxiliary_driver(qcom_tpm_driver);
++
++MODULE_LICENSE("GPL");
+diff --git a/drivers/firmware/qcom/qcom_qseecom.c b/drivers/firmware/qcom/qcom_qseecom.c
+index 731e6d5719f9..ccbd93a01af6 100644
+--- a/drivers/firmware/qcom/qcom_qseecom.c
++++ b/drivers/firmware/qcom/qcom_qseecom.c
+@@ -85,6 +85,7 @@ static int qseecom_client_register(struct platform_device *qseecom_dev,
+  */
+ static const struct qseecom_app_desc qcom_qseecom_apps[] = {
+ 	{ "qcom.tz.uefisecapp", "uefisecapp" },
++	{ "qcom.tz.tpm", "tpm" },
+ };
+ 
+ static int qcom_qseecom_probe(struct platform_device *qseecom_dev)
+diff --git a/drivers/firmware/qcom/qcom_tzmem.c b/drivers/firmware/qcom/qcom_tzmem.c
+index ea0a35355657..3461ead32a85 100644
+--- a/drivers/firmware/qcom/qcom_tzmem.c
++++ b/drivers/firmware/qcom/qcom_tzmem.c
+@@ -109,25 +109,44 @@ static int qcom_tzmem_init(void)
+ 	return 0;
+ }
+ 
+-static int qcom_tzmem_init_area(struct qcom_tzmem_area *area)
++int qcom_tzmem_init_addr(phys_addr_t paddr, phys_addr_t size, u64 *handle)
+ {
+ 	u64 pfn_and_ns_perm, ipfn_and_s_perm, size_and_flags;
+-	int ret;
+ 
+ 	if (!qcom_tzmem_using_shm_bridge)
+ 		return 0;
+ 
+-	pfn_and_ns_perm = (u64)area->paddr | QCOM_SCM_PERM_RW;
+-	ipfn_and_s_perm = (u64)area->paddr | QCOM_SCM_PERM_RW;
+-	size_and_flags = area->size | (1 << QCOM_SHM_BRIDGE_NUM_VM_SHIFT);
++	pfn_and_ns_perm = (u64)paddr | QCOM_SCM_PERM_RW;
++	ipfn_and_s_perm = (u64)paddr | QCOM_SCM_PERM_RW;
++	size_and_flags = size | (1 << QCOM_SHM_BRIDGE_NUM_VM_SHIFT);
++
++	return qcom_scm_shm_bridge_create(pfn_and_ns_perm, ipfn_and_s_perm,
++					  size_and_flags, QCOM_SCM_VMID_HLOS,
++					  handle);
++}
++EXPORT_SYMBOL_GPL(qcom_tzmem_init_addr);
++
++void qcom_tzmem_cleanup_addr(u64 handle)
++{
++	if (!qcom_tzmem_using_shm_bridge)
++		return;
++
++	qcom_scm_shm_bridge_delete(handle);
++}
++EXPORT_SYMBOL_GPL(qcom_tzmem_cleanup_addr);
++
++static int qcom_tzmem_init_area(struct qcom_tzmem_area *area)
++{
++	int ret;
++
++	if (!qcom_tzmem_using_shm_bridge)
++		return 0;
+ 
+ 	u64 *handle __free(kfree) = kzalloc(sizeof(*handle), GFP_KERNEL);
+ 	if (!handle)
+ 		return -ENOMEM;
+ 
+-	ret = qcom_scm_shm_bridge_create(pfn_and_ns_perm, ipfn_and_s_perm,
+-					 size_and_flags, QCOM_SCM_VMID_HLOS,
+-					 handle);
++	ret = qcom_tzmem_init_addr(area->paddr, area->size, handle);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -139,11 +158,7 @@ static int qcom_tzmem_init_area(struct qcom_tzmem_area *area)
+ static void qcom_tzmem_cleanup_area(struct qcom_tzmem_area *area)
+ {
+ 	u64 *handle = area->priv;
+-
+-	if (!qcom_tzmem_using_shm_bridge)
+-		return;
+-
+-	qcom_scm_shm_bridge_delete(*handle);
++	qcom_tzmem_cleanup_addr(*handle);
+ 	kfree(handle);
+ }
+ 
+diff --git a/include/linux/firmware/qcom/qcom_tzmem.h b/include/linux/firmware/qcom/qcom_tzmem.h
+index b83b63a0c049..f3714e6cda43 100644
+--- a/include/linux/firmware/qcom/qcom_tzmem.h
++++ b/include/linux/firmware/qcom/qcom_tzmem.h
+@@ -51,6 +51,9 @@ void qcom_tzmem_free(void *ptr);
+ 
+ DEFINE_FREE(qcom_tzmem, void *, if (_T) qcom_tzmem_free(_T))
+ 
++int qcom_tzmem_init_addr(phys_addr_t paddr, phys_addr_t size, u64 *handle);
++void qcom_tzmem_cleanup_addr(u64 handle);
++
+ phys_addr_t qcom_tzmem_to_phys(void *ptr);
+ 
+ #endif /* __QCOM_TZMEM */
+-- 
+2.51.0
+
